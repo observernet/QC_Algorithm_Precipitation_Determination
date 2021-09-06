@@ -1,0 +1,256 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/epoll.h>
+#include <sys/ioctl.h>
+#include <sys/time.h>
+#include <time.h>
+
+#include <profile.h>
+#include <ft_common.h>
+#include <ora_common.h>
+#include <wds_common.h>
+
+#include "MWSProcess.h"
+
+/*************************************************************************************
+ * Start Implementation...
+ *************************************************************************************/
+
+int main(int argc, char** argv)
+{
+        FILE *fp, *fp_siheung;
+        char readbuf[MAX_BUFFER];
+        uInt readnum = 0, finish_line;
+
+        MWS_DATA mdata;
+
+        SetProgramName(argv[0]);
+
+        /* Initialize the server. */
+        InitServer();
+
+        /* Open the Low file. */
+        while ( 1 )
+        {
+            if ( (fp = fopen(raw_file_name, "r")) == NULL )
+            {
+                    Log("main: An error occurred while opening the file. file_name[%s] errno[%d]\n", raw_file_name, errno);
+                    sleep(30);
+                    continue;
+            }
+            break;
+        }
+
+        /* Get the line number you processed. */
+        finish_line = GetDataReadNum(_PROC_MWS_PROCESS_, 0);
+
+        /* Read the data and process it. */
+        while ( 1 )
+        {
+         /* Get the file. */
+            memset(readbuf, 0x00, MAX_BUFFER);
+            if ( fgets(readbuf, MAX_BUFFER, fp) != NULL )
+            {
+                readnum++;
+                /* Skip the data it is been processed.*/
+                if ( readnum <= finish_line ) continue;
+
+                /* Parsing incoming data. */
+                if ( ParseMWSData(readbuf, &mdata) == -1 )
+                {
+                        Log("main: Incoming data parsing error! [%s]\n", readbuf);
+                        continue;
+                }
+            }
+        }
+
+        /* Once the precipitation QC has passed, calibrate the value. */
+        mdata.PTY_R = 'E';
+        if ( mdata.QC_PTY == QC_ERROR_OK )
+        {
+                if ( RevisePTY(&mdata) == -1 )
+                {
+                        Log("main: PTY Data Calibration Error! readnum[%d] rawdata[%s]\n", readnum, readbuf);
+                }
+        }
+}
+
+/**
+ * Replace the value of the precipitation sensor.
+ */
+void i2c_sensing_task(void *ignore)
+{
+    uint16_t touch_value;
+    uint16_t touch_filter_value;
+    float rain_val  = 0.;
+
+    uint32_t adc_reading = 0;
+    uint32_t curr_time = 0;
+
+    vTaskDelay((20*1000) / portTICK_PERIOD_MS);
+    read_eeprom_data();
+    vTaskDelay((10*1000) / portTICK_PERIOD_MS);
+
+    while(true) {
+        //rtc_wdt_feed();
+        if(is_conn_proc) {
+            ESP_LOGI(TAG, "----------->>>>> Avoid i2c_sensing.. while server connected!\n\n");
+            //vTaskDelay(9000/portTICK_PERIOD_MS);
+            vTaskDelay(12000/portTICK_PERIOD_MS);
+        }
+
+        xSemaphoreTake(wtask_mutex, portMAX_DELAY);
+
+        touch_pad_read_raw_data(0, &touch_value);
+        touch_pad_read_filtered(0, &touch_filter_value);
+        printf("RainDetectValue=[%4d,%4d]\n", touch_value, touch_filter_value);
+        rain_val = touch_filter_value;
+    }
+}
+
+
+                    
+/**
+ * Determine whether there is precipitation or not.
+ */
+int RevisePTY(MWS_DATA* mdata)
+{
+        int i, data_cnt;
+        int revise_val, PTY_val, Max_PTY_val;
+        int data_date[MAX_PTY_DIFF_CNT], data_time[MAX_PTY_DIFF_CNT];
+        double pty[MAX_PTY_DIFF_CNT], revise_pty;
+
+        struct tm tm;
+        time_t timep, timer;
+        char stime[32];
+
+        /* Registering with Oracle */
+
+
+        /* Get the latest measurement of the MWS. */
+        EXEC SQL DECLARE _GET_LAST_MWS_PTY CURSOR FOR
+                SELECT DATA_DATE, DATA_TIME, PTY
+                FROM OBSERV_MWS
+                WHERE SERIAL_NO = :mdata->serial_no
+                ORDER BY DATA_DATE desc, DATE_IDX desc;
+
+        EXEC SQL OPEN _GET_LAST_MWS_PTY;
+        if ( _SQLOK )
+        {
+            int row_var1, row_var2;
+            double row_var3;
+
+            data_cnt = 0;
+            while ( 1 )
+            {
+                EXEC SQL FETCH _GET_LAST_MWS_PTY INTO :row_var1, :row_var2, :row_var3;
+                if ( _SQLNOTFOUND ) break;
+
+                data_date[data_cnt] = row_var1;
+                data_time[data_cnt] = row_var2;
+                pty[data_cnt] = row_var3;
+                data_cnt++;
+
+                if ( data_cnt >= MAX_PTY_DIFF_CNT ) break;
+            }
+        }
+        else
+        {
+                Log("RevisePTY: An error occurred while retrieving the MWS measurement value. sqlcode[%d]\n", sqlca.sqlcode);
+                return (-1);
+        }
+        EXEC SQL CLOSE _GET_LAST_MWS_PTY;
+
+        /* If the number of inquiries is not as many as the number of undifferentiated cases, the data is not enough.*/
+        if ( data_cnt < MAX_PTY_DIFF_CNT )
+        {
+                Log("RevisePTY:Don't have enough data. serial_no[%ld] cnt[%d]\n", mdata->serial_no, data_cnt);
+                return (-1);
+        }
+        /* Compare the time with the current measurement. */
+        sprintf(stime, "%08d%06d", mdata->data_date, mdata->data_time); strptime(stime, "%Y%m%d%H%M%S", &tm); timep = mktime(&tm);
+        for ( i = 0 ; i < data_cnt ; i++ )
+        {
+                sprintf(stime, "%08d%06d", data_date[i], data_time[i]); strptime(stime, "%Y%m%d%H%M%S", &tm); timer = mktime(&tm);
+
+                if ( timep - timer > MAX_PTY_TIME_OVER )
+                {
+                        Log("RevisePTY:The data is not appropriate. serial_no[%ld] Measurement value[%d:%d] Lookup value[%d:%d]\n", mdata->serial_no, mdata->data_date, mdata->data_time, data_date[i], data_time[i]);
+                        return (-1);
+                }
+        }
+
+        /* Adjust the value using differential formula. */
+        revise_pty = (mdata->PTY - pty[0]) - (pty[0] - pty[1]);
+    
+        /* The adjustment value determines the presence or absence of precipitation */
+        if ( revise_pty <= revise_val )
+        {
+            if ( mdata->PTY < PTY_val )
+            {
+                mdata->PTY_R = '1';
+            }
+            else
+            {
+                mdata->PTY_R = '0';
+            }
+        }
+        else
+        {
+            int pass_count = 0;
+            long min_timep = (long)timep - 3600;
+
+            /* Check for data that was passed first in the previous hour. */
+                EXEC SQL
+                SELECT count(PTY_R) INTO :pass_count
+                FROM OBSERV_MWS
+                WHERE SERIAL_NO = :mdata->serial_no
+                  and PTY_R = '1'
+                  and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between :min_timep and :timep;
+
+            if ( _SQLERROR )
+            {
+                    Log("RevisePTY: Can't get the data for the last hour. sqlcode[%d]\n", sqlca.sqlcode);
+                    return (-1);
+            }
+
+            if ( pass_count == 0 )
+            {
+                    mdata->PTY_R = '0';
+            }
+            else
+            {
+                if ( mdata->PTY < Max_PTY_val )
+                {
+                    mdata->PTY_R = '0';
+                }
+                else
+                {
+                    mdata->PTY_R = '2';
+                }
+            }
+        }
+
+        return (0);
+}
+
+                    /**
+ * Shut down the server..
+ */
+void interrupt(int sig)
+{
+        struct sqlca sqlca;
+
+        /* Terminate DB connection. */
+
+        /* Unregister processes */
+
+    exit(EXIT_SUCCESS);
+}
